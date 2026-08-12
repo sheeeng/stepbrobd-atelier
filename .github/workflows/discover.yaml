@@ -12,11 +12,11 @@ on:
       repository:
         description: Atelier repository
         type: string
-        default: stepbrobd/atelier
+        default: ""
       ref:
         description: Atelier repository Git ref
         type: string
-        default: master
+        default: ""
       rules:
         description: Rule file path
         type: string
@@ -126,7 +126,12 @@ jobs:
           RULES: ${{ inputs.rules }}
           ATTR: ${{ inputs.attr }}
           TOOL: ${{ inputs.tool }}
-          TOOL_DEFAULT: github:${{ inputs.repository }}/${{ inputs.ref }}
+          REPOSITORY: ${{ inputs.repository }}
+          REF: ${{ inputs.ref }}
+          REPOSITORY_DEFAULT: stepbrobd/atelier
+          REF_DEFAULT: master
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
           # nix-eval-jobs uses up to ~4 GiB per worker, so the aggregate
           # (workers x 4 GiB) must fit the runner; a low count keeps heavy
           # config toplevel evals from OOM-killing the whole runner
@@ -136,6 +141,19 @@ jobs:
           ON_AARCH64_DARWIN: ${{ inputs.aarch64-darwin }}
         run: |
           set -euo pipefail
+
+          resolve_tool() {
+            if [ -n "$TOOL" ]; then
+              printf '%s\n' "$TOOL"
+            elif [ -n "$REPOSITORY" ] || [ -n "$REF" ]; then
+              printf 'github:%s/%s\n' \
+                "${REPOSITORY:-$REPOSITORY_DEFAULT}" \
+                "${REF:-$REF_DEFAULT}"
+            else
+              printf 'github:%s/%s\n' "$WORKFLOW_REPOSITORY" "$WORKFLOW_SHA"
+            fi
+          }
+ 
           systems=""
           [ "${ON_X8664_LINUX:-true}" != "false" ] && systems="${systems:+$systems,}x86_64-linux"
           [ "${ON_AARCH64_LINUX:-true}" != "false" ] && systems="${systems:+$systems,}aarch64-linux"
@@ -150,7 +168,7 @@ jobs:
             exit 0
           fi
 
-          nix run "${TOOL:-$TOOL_DEFAULT}" -- \
+          nix run "$(resolve_tool)" -- \
             discover --rules "$RULES" --flake . --systems "$systems" --attr "$ATTR" --workers "${WORKERS:-2}"
 
   Build:
