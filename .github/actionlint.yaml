@@ -1,5 +1,6 @@
 paths:
   .github/workflows/**/*.{yaml,yml}:
     ignore:
+      - property "workflow_(repository|sha|ref|file_path)" is not defined in object type
       - reusable workflow call "\$/.+" at "uses" is not following the format
       - specifying action "\$/.+" in invalid format because ref is missing
