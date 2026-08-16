@@ -186,11 +186,7 @@ def _eval_command(
     cmd = [
         "nix",
         "run",
-        # nixpkgs#nix-eval-jobs 2.35.0 cache status resolver bug
-        # https://github.com/NixOS/nix-eval-jobs/issues/430
-        # temporary override drop after fix
-        "github:stepbrobd/inc#nix-eval-jobs",
-        # "nixpkgs#nix-eval-jobs",
+        "nixpkgs#nix-eval-jobs",
         "--",
         "--flake",
         flake,
