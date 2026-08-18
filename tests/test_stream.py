@@ -653,3 +653,18 @@ def test_cli_final_replays_log_and_touches_sentinel(tmp_path: Path) -> None:
     assert proc.returncode == 0
     assert "streamer said hi" in proc.stdout
     assert (tmp_path / "atelier-stream.done").exists()
+
+
+def test_main_uses_the_runner_temp_names_build_yaml_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[Path] = []
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setattr(stream, "mode_final", lambda *a: seen.extend(a))
+    monkeypatch.setattr(sys, "argv", ["stream.py", "--mode", "final"])
+    assert stream.main() == 0
+    assert [p.name for p in seen[1:]] == [
+        "atelier-stream.done",
+        "atelier-stream.pid",
+        "atelier-stream.log",
+    ]
