@@ -142,9 +142,13 @@ jobs:
             echo "::warning::Skipping cache streamer: setup did not complete"
             exit 0
           fi
+          # a stale sentinel or pidfile from a prior job on a persistent
+          # runner must not stop or stall this job's streamer
+          rm -f "${RUNNER_TEMP}/atelier-stream.done" "${RUNNER_TEMP}/atelier-stream.pid"
           python3 "${ATELIER_ROOT}/src/atelier/stream.py" --mode stream \
             > "${RUNNER_TEMP}/atelier-stream.log" 2>&1 &
-          printf '%s' "$!" > "${RUNNER_TEMP}/atelier-stream.pid"
+          printf '%s' "$!" > "${RUNNER_TEMP}/atelier-stream.pid" \
+            || echo "::warning::Could not record the streamer pid"
 
       - name: Build
         id: build
@@ -158,12 +162,12 @@ jobs:
       # post-push. with built-in backends the streamer has already been
       # pushing during the build, and the final drain below re-pushes the
       # full spool plus the outputs' closure as the backstop, also on a
-      # failed build (!cancelled) so partial results land on the cache. the
-      # pre/post hooks keep their success-only timing unless the built-in
-      # drain runs, and only for a real build failure (not a setup failure,
-      # where no push happens).
-      # each step is env-passed and not interpolated into the run body so it
-      # cannot break out of the run
+      # failed build (never on a cancelled or setup-failed cell) so partial
+      # results land on the cache. the pre/post hooks keep their success-only
+      # timing unless the built-in drain runs, and only for a real build
+      # failure (not a setup failure, where no push happens). each step is
+      # env-passed and not interpolated into the run body so it cannot break
+      # out of the run
       - name: Pre Push Hook
         if: ${{ inputs.push && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && inputs.pre-push != '' && (success() || (!cancelled() && steps.build.outcome == 'failure' && inputs.push-command == '' && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != ''))) }}
         shell: bash
@@ -182,7 +186,7 @@ jobs:
           bash -c "${PRE_PUSH}"
 
       - name: Push To Cache
-        if: ${{ !cancelled() && inputs.push && inputs.push-command == '' && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
+        if: ${{ (success() || (!cancelled() && steps.build.outcome == 'failure')) && inputs.push && inputs.push-command == '' && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
         shell: bash
         env:
           BUILD_OUTCOME: ${{ steps.build.outcome }}
