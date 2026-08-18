@@ -27,6 +27,7 @@
             # code
             ./src
             ./tests
+            ./.github/actions/atelier/hook.sh
             # meta
             ./license.txt
             ./pyproject.toml
