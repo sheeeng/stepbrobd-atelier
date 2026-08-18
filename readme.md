@@ -169,6 +169,15 @@ Pushes happen on a push to your repository's default branch (or `master`) and on
 a run with `push: true`. Forked-PR runs never push. Caching is best-effort: a
 failed push to any backend is logged as a warning and never fails the build.
 
+Uploads start while the build runs: a post-build hook records every locally
+built store path, and a background uploader pushes them to every configured
+backend as they appear. After the build, a final drain re-pushes the full set
+plus the finished outputs' closure, so substituted dependencies missing from
+your cache still land there. A failed build pushes the paths it built before
+failing, and a cancelled or timed-out run keeps whatever was uploaded before the
+kill. On a self-hosted runner a cancelled cell can leave the background uploader
+running until the runner reaps job processes.
+
 ## Use it in your repo
 
 Atelier runs against whatever repository calls it. `actions/checkout` inside the
@@ -322,6 +331,13 @@ jobs:
 
 `pre-push`, `post-push`, and `push-command` apply only to the build cells (the
 discovery job never pushes). They share the `push: true` guard.
+
+With built-in backends the push begins during the build, so `pre-push` runs
+before the final drain rather than before all push activity. Streamed batches
+that need a `pre-push` side effect fail soft and are re-pushed by the final
+drain after the hook has run. When a build fails and a built-in backend is
+configured, `pre-push` and `post-push` also run around the failure-path drain.
+With `push-command` set, hook timing is unchanged.
 
 `push-command` replaces the built-in push exactly like `install-command`
 replaces the installer (set it and the native Attic/Cachix/niks3 push is
