@@ -258,10 +258,13 @@ optional inputs change that without forking:
 Atelier separates installing Nix from configuring it. Whichever installer runs,
 Atelier applies its own required `nix.conf` afterwards (the GitHub access token,
 `experimental-features = nix-command flakes`, the build directory, the target
-`system`, and the sandbox mode), then appends your `extra-conf` last. So a
-custom installer still ends up with a correctly configured daemon, and adding
-settings is independent of the installer choice. Use Nix's `extra-` prefixes to
-add to a list setting rather than replace it.
+`system`, the sandbox mode, and the post-build hook), then appends your
+`extra-conf` last. So a custom installer still ends up with a correctly
+configured daemon, and adding settings is independent of the installer choice.
+Use Nix's `extra-` prefixes to add to a list setting rather than replace it.
+With a binary cache configured it also sets `post-build-hook` to record built
+paths for streaming. A `post-build-hook` of your own in `extra-conf` wins and
+replaces streaming.
 
 The inputs apply to every job, so discovery and every build cell use the same
 Nix. Install Lix instead of upstream Nix and enable the pipe operator:
