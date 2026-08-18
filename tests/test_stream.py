@@ -638,3 +638,18 @@ def test_cli_missing_runner_temp_warns_and_exits_zero() -> None:
     )
     assert proc.returncode == 0
     assert "::warning::Cache push failed" in proc.stdout
+
+
+def test_cli_final_replays_log_and_touches_sentinel(tmp_path: Path) -> None:
+    # pins the RUNNER_TEMP file names build.yaml writes
+    (tmp_path / "atelier-stream.log").write_text("streamer said hi\n")
+    proc = subprocess.run(
+        [sys.executable, stream.__file__, "--mode", "final"],
+        env={"RUNNER_TEMP": str(tmp_path), "ATELIER_SPOOL": str(tmp_path / "spool")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "streamer said hi" in proc.stdout
+    assert (tmp_path / "atelier-stream.done").exists()
