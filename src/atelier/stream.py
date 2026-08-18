@@ -238,7 +238,11 @@ def push(backend: Backend, paths: list[str]) -> None:
         try:
             backend.push(paths[i : i + BATCH])
         except Exception as e:  # noqa: BLE001
-            _warn(f"{backend.name} push failed: {e}")
+            # a CalledProcessError str embeds the whole argv, keep it short
+            reason: object = e
+            if isinstance(e, subprocess.CalledProcessError):
+                reason = f"exit {e.returncode}"
+            _warn(f"{backend.name} push failed: {reason}")
 
 
 # tool installs share one nix profile, serialize the setups

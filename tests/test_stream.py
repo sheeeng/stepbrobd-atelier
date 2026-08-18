@@ -668,3 +668,19 @@ def test_main_uses_the_runner_temp_names_build_yaml_writes(
         "atelier-stream.pid",
         "atelier-stream.log",
     ]
+
+
+def test_push_warning_omits_argv(capsys: pytest.CaptureFixture[str]) -> None:
+    class Argv:
+        name = "Argv"
+
+        def setup(self) -> None:
+            pass
+
+        def push(self, paths: list[str]) -> None:
+            raise subprocess.CalledProcessError(2, ["attic", "push", *paths])
+
+    push(Argv(), ["/nix/store/aaa-x"])
+    out = capsys.readouterr().out
+    assert "::warning::Argv push failed: exit 2" in out
+    assert "/nix/store/aaa-x" not in out
