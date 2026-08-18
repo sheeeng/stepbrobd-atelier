@@ -1,6 +1,8 @@
 import ast
 import io
+import os
 import stat
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -14,6 +16,7 @@ from atelier.stream import (
     Cachix,
     Niks3,
     backends,
+    mode_final,
     mode_stream,
     push,
     read_new,
@@ -462,3 +465,176 @@ def test_stream_backend_warns_when_reader_dies(
     monkeypatch.setattr(stream, "read_new", boom)
     stream_backend(_Sink(), tmp_path / "spool", tmp_path / "done")
     assert "::warning::Sink streamer stopped" in capsys.readouterr().out
+
+
+def test_mode_final_dedups_and_pushes_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    spool.write_text("/nix/store/aaa-x\n/nix/store/aaa-x\n/nix/store/bbb-y\n")
+    monkeypatch.delenv("BUILD_OUTCOME", raising=False)
+    sink = _Sink()
+    monkeypatch.setattr(stream, "backends", lambda: [sink])
+    mode_final(spool, tmp_path / "done", tmp_path / "pid", tmp_path / "log")
+    assert sink.pushed == ["/nix/store/aaa-x", "/nix/store/bbb-y"]
+    assert (tmp_path / "done").exists()
+
+
+def test_mode_final_appends_outputs_only_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    spool.write_text("/nix/store/aaa-x\n")
+    monkeypatch.setenv("BUILD_OUTCOME", "success")
+    monkeypatch.setenv("INSTALLABLE", ".#pkg")
+    seen: list[str] = []
+
+    def outputs(installable: str) -> list[str]:
+        seen.append(installable)
+        return ["/nix/store/aaa-x", "/nix/store/fff-out"]
+
+    monkeypatch.setattr(stream, "_outputs", outputs)
+    sink = _Sink()
+    monkeypatch.setattr(stream, "backends", lambda: [sink])
+    mode_final(spool, tmp_path / "done", tmp_path / "pid", tmp_path / "log")
+    assert seen == [".#pkg"]
+    # finals overlap the spool when the top drv was built locally, dedup holds
+    assert sink.pushed == ["/nix/store/aaa-x", "/nix/store/fff-out"]
+
+
+def test_mode_final_failure_outcome_skips_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    spool.write_text("/nix/store/aaa-x\n")
+    monkeypatch.setenv("BUILD_OUTCOME", "failure")
+
+    def boom(installable: str) -> list[str]:
+        raise AssertionError("must not resolve outputs on failure")
+
+    monkeypatch.setattr(stream, "_outputs", boom)
+    sink = _Sink()
+    monkeypatch.setattr(stream, "backends", lambda: [sink])
+    mode_final(spool, tmp_path / "done", tmp_path / "pid", tmp_path / "log")
+    assert sink.pushed == ["/nix/store/aaa-x"]
+
+
+def test_mode_final_empty_set_pushes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BUILD_OUTCOME", raising=False)
+    called = False
+
+    def probe() -> list[stream.Backend]:
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(stream, "backends", probe)
+    mode_final(
+        tmp_path / "spool", tmp_path / "done", tmp_path / "pid", tmp_path / "log"
+    )
+    assert called is False
+
+
+def test_mode_final_replays_streamer_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "log").write_text("hello from the streamer\n")
+    monkeypatch.delenv("BUILD_OUTCOME", raising=False)
+    monkeypatch.setattr(stream, "backends", list)
+    mode_final(
+        tmp_path / "spool", tmp_path / "done", tmp_path / "pid", tmp_path / "log"
+    )
+    out = capsys.readouterr().out
+    assert "::group::Streamer log" in out
+    assert "hello from the streamer" in out
+    assert "::endgroup::" in out
+
+
+def test_mode_final_waits_for_dead_pid_instantly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a pid that cannot exist, kill(pid, 0) raises and the wait returns
+    (tmp_path / "pid").write_text("99999999")
+    monkeypatch.delenv("BUILD_OUTCOME", raising=False)
+    monkeypatch.setattr(stream, "backends", list)
+    mode_final(
+        tmp_path / "spool", tmp_path / "done", tmp_path / "pid", tmp_path / "log"
+    )
+
+
+def test_cli_exits_zero_without_backends(tmp_path: Path) -> None:
+    # run by file path exactly as the workflow does
+    env = {"RUNNER_TEMP": str(tmp_path), "ATELIER_SPOOL": str(tmp_path / "spool")}
+    for mode in ("stream", "final"):
+        proc = subprocess.run(
+            [sys.executable, stream.__file__, "--mode", mode],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_outputs_resolves_and_surfaces_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[list[str]] = []
+
+    def ok(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="/nix/store/fff-out\n\n", stderr=""
+        )
+
+    monkeypatch.setattr(stream.subprocess, "run", ok)
+    assert stream._outputs(".#pkg") == ["/nix/store/fff-out"]
+    assert seen == [["nix", "build", ".#pkg^*", "--no-link", "--print-out-paths"]]
+
+    def boom(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, argv, stderr="error: attribute missing")
+
+    monkeypatch.setattr(stream.subprocess, "run", boom)
+    assert stream._outputs(".#pkg") == []
+    out = capsys.readouterr().out
+    assert "error: attribute missing" in out
+    assert "::warning::Final output resolution failed" in out
+
+
+def test_wait_warns_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # a live pid with a zero budget takes the timeout path immediately
+    (tmp_path / "pid").write_text(str(os.getpid()))
+    monkeypatch.setattr(stream, "WAIT", 0.0)
+    stream._wait(tmp_path / "pid")
+    assert "Streamer still running" in capsys.readouterr().out
+
+
+def test_replay_tolerates_bad_bytes_and_missing_newline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "log"
+    log.write_bytes(b"partial \xff line without newline")
+    stream._replay(log)
+    out = capsys.readouterr().out
+    assert out.startswith("::group::Streamer log\n")
+    assert out.endswith("\n::endgroup::\n")
+
+
+def test_cli_missing_runner_temp_warns_and_exits_zero() -> None:
+    proc = subprocess.run(
+        [sys.executable, stream.__file__, "--mode", "final"],
+        env={},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "::warning::Cache push failed" in proc.stdout

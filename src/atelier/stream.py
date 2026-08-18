@@ -12,10 +12,12 @@ succeeded, the final outputs' closure. Both modes exit 0 unconditionally
 because a cache push never fails a build.
 """
 
+import argparse
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,7 +29,7 @@ from typing import Protocol
 
 # paths per tool invocation, keeps argv far under ARG_MAX on both platforms
 BATCH = 1000
-# seconds between spool polls when idle
+# seconds between spool and pid polls when idle
 POLL = 2.0
 # seconds final mode waits for the streamer to drain before proceeding
 WAIT = 900.0
@@ -279,3 +281,99 @@ def mode_stream(spool: Path, done: Path) -> None:
         t.start()
     for t in threads:
         t.join()
+
+
+def _wait(pidfile: Path) -> None:
+    # bounded wait, a hung streamer only costs duplicate bandwidth
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(POLL)
+    _warn("Streamer still running after wait timeout, pushing anyway")
+
+
+def _replay(log: Path) -> None:
+    if not log.exists():
+        return
+    text = log.read_text(errors="replace")
+    print("::group::Streamer log")
+    sys.stdout.write(text)
+    # github only parses commands at line start, keep the group closable
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
+    print("::endgroup::", flush=True)
+
+
+def _outputs(installable: str) -> list[str]:
+    # the final outputs, resolvable only after a successful build
+    if not installable:
+        return []
+    try:
+        proc = subprocess.run(
+            ["nix", "build", f"{installable}^*", "--no-link", "--print-out-paths"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=WAIT,
+        )
+    except Exception as e:  # noqa: BLE001
+        # str(CalledProcessError) omits the captured stderr, print it too
+        stderr = str(getattr(e, "stderr", "") or "").strip()
+        if stderr:
+            print(stderr[-2000:], flush=True)
+        _warn(f"Final output resolution failed: {e}")
+        return []
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def mode_final(spool: Path, done: Path, pidfile: Path, log: Path) -> None:
+    done.touch()
+    try:
+        _wait(pidfile)
+        _replay(log)
+    except Exception as e:  # noqa: BLE001
+        # a preamble failure must never cost the drain itself
+        _warn(f"Streamer wait or log replay failed: {e}")
+    paths = read_new(spool, 0)[0]
+    if os.environ.get("BUILD_OUTCOME") == "success":
+        installable = os.environ.get("INSTALLABLE", "")
+        if not installable:
+            _warn("INSTALLABLE is not set, skipping the final closure push")
+        # the closure sweep also covers substituted deps missing on the cache
+        paths += _outputs(installable)
+    paths = list(dict.fromkeys(paths))
+    if not paths:
+        return
+    for b in backends():
+        if ready(b):
+            push(b, paths)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("stream", "final"), required=True)
+    mode = ap.parse_args().mode
+    spool = Path(os.environ.get("ATELIER_SPOOL", "/nix/var/atelier/spool"))
+    tmp = Path(os.environ["RUNNER_TEMP"])
+    done = tmp / "atelier-stream.done"
+    if mode == "stream":
+        mode_stream(spool, done)
+    else:
+        mode_final(spool, done, tmp / "atelier-stream.pid", tmp / "atelier-stream.log")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001
+        # a cache push must never fail the build, even on an internal bug
+        _warn(f"Cache push failed: {e!r}")
+        sys.exit(0)
