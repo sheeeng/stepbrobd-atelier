@@ -2,13 +2,24 @@ import ast
 import io
 import stat
 import sys
+import threading
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
 from atelier import stream
-from atelier.stream import Attic, Cachix, Niks3, backends, push, read_new, ready
+from atelier.stream import (
+    Attic,
+    Cachix,
+    Niks3,
+    backends,
+    mode_stream,
+    push,
+    read_new,
+    ready,
+    stream_backend,
+)
 
 
 def test_read_new_returns_complete_lines_and_offset(tmp_path: Path) -> None:
@@ -340,3 +351,114 @@ def test_ready_reports_working_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     _record(monkeypatch)
     monkeypatch.setenv("CACHIX_AUTH_TOKEN", "t")
     assert ready(Cachix("d")) is True
+
+
+class _Sink:
+    def __init__(self, fail_setup: bool = False) -> None:
+        self.name = "Sink"
+        self.fail_setup = fail_setup
+        self.setups = 0
+        self.pushed: list[str] = []
+        self.idents: list[int] = []
+
+    def setup(self) -> None:
+        self.setups += 1
+        if self.fail_setup:
+            raise RuntimeError("no")
+
+    def push(self, paths: list[str]) -> None:
+        self.idents.append(threading.get_ident())
+        self.pushed.extend(paths)
+
+
+def test_stream_backend_drains_then_exits_on_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    done = tmp_path / "done"
+    spool.write_text("/nix/store/aaa-x\n/nix/store/bbb-y\n")
+    done.touch()
+    sink = _Sink()
+    monkeypatch.setattr(stream.time, "sleep", lambda _: pytest.fail("loop did not exit"))
+    stream_backend(sink, spool, done)
+    assert sink.pushed == ["/nix/store/aaa-x", "/nix/store/bbb-y"]
+
+
+def test_stream_backend_exits_when_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spool = tmp_path / "spool"
+    done = tmp_path / "done"
+    spool.write_text("/nix/store/aaa-x\n")
+    sink = _Sink(fail_setup=True)
+    # no sentinel, the disabled backend must still return
+    monkeypatch.setattr(stream.time, "sleep", lambda _: pytest.fail("loop did not exit"))
+    stream_backend(sink, spool, done)
+    assert sink.pushed == []
+    assert "Sink disabled" in capsys.readouterr().out
+
+
+def test_mode_stream_runs_one_thread_per_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    done = tmp_path / "done"
+    spool.write_text("/nix/store/aaa-x\n")
+    done.touch()
+    sinks = [_Sink(), _Sink()]
+    monkeypatch.setattr(stream, "backends", lambda: list(sinks))
+    mode_stream(spool, done)
+    assert sinks[0].pushed == ["/nix/store/aaa-x"]
+    assert sinks[1].pushed == ["/nix/store/aaa-x"]
+    # one real thread per backend, neither on the caller's thread
+    idents = {sinks[0].idents[0], sinks[1].idents[0]}
+    assert len(idents) == 2
+    assert threading.get_ident() not in idents
+
+
+def test_mode_stream_without_backends_warns_and_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(stream, "backends", list)
+    mode_stream(tmp_path / "spool", tmp_path / "done")
+    assert "No cache backend configured" in capsys.readouterr().out
+
+
+def test_stream_backend_streams_across_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    done = tmp_path / "done"
+    spool.write_text("")
+    sink = _Sink()
+    ticks: list[int] = []
+
+    def tick(_: float) -> None:
+        ticks.append(1)
+        if len(ticks) == 1:
+            spool.write_text("/nix/store/aaa-x\n")
+        elif len(ticks) == 2:
+            spool.write_text("/nix/store/aaa-x\n/nix/store/bbb-y\n")
+            done.touch()
+        elif len(ticks) > 5:
+            pytest.fail("loop did not terminate")
+
+    monkeypatch.setattr(stream.time, "sleep", tick)
+    stream_backend(sink, spool, done)
+    assert sink.pushed == ["/nix/store/aaa-x", "/nix/store/bbb-y"]
+    assert sink.setups == 1
+
+
+def test_stream_backend_warns_when_reader_dies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(spool: Path, offset: int) -> tuple[list[str], int]:
+        raise PermissionError("spool unreadable")
+
+    monkeypatch.setattr(stream, "read_new", boom)
+    stream_backend(_Sink(), tmp_path / "spool", tmp_path / "done")
+    assert "::warning::Sink streamer stopped" in capsys.readouterr().out

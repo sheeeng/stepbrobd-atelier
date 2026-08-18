@@ -17,6 +17,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -235,3 +237,45 @@ def push(backend: Backend, paths: list[str]) -> None:
             backend.push(paths[i : i + BATCH])
         except Exception as e:  # noqa: BLE001
             _warn(f"{backend.name} push failed: {e}")
+
+
+# tool installs share one nix profile, serialize the setups
+_SETUP = threading.Lock()
+
+
+def stream_backend(backend: Backend, spool: Path, done: Path) -> None:
+    # own offset per backend, exits once the sentinel exists and every
+    # complete line has been read, or immediately when setup fails
+    offset = 0
+    ok: bool | None = None
+    try:
+        while True:
+            lines, offset = read_new(spool, offset)
+            if lines:
+                if ok is None:
+                    with _SETUP:
+                        ok = ready(backend)
+                if not ok:
+                    return
+                push(backend, lines)
+            elif done.exists():
+                return
+            else:
+                time.sleep(POLL)
+    except Exception as e:  # noqa: BLE001
+        # a dead reader is invisible otherwise, final mode re-pushes the spool
+        _warn(f"{backend.name} streamer stopped: {e}")
+
+
+def mode_stream(spool: Path, done: Path) -> None:
+    bs = backends()
+    if not bs:
+        _warn("No cache backend configured, streamer exiting")
+        return
+    threads = [
+        threading.Thread(target=stream_backend, args=(b, spool, done)) for b in bs
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
