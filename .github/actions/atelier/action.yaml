@@ -23,13 +23,30 @@ inputs:
   rules:
     description: Atelier rule file whose substituters and trusted-public-keys are injected into nix.conf
     default: atelier.toml
+  post-build-hook:
+    description: Install the spooling post-build hook and name it in nix.conf
+    default: "false"
 
 runs:
   using: composite
   steps:
+    - name: Export Atelier Root
+      # publish the action checkout's repo root so later workflow steps can
+      # invoke files shipped with atelier (the runner downloads the whole
+      # repository for a subdirectory action)
+      shell: bash
+      run: | # zizmor: ignore[github-env] value is the runner-provided action path, not consumer input
+        # a failed strip must collapse to the empty value the push step guards
+        root="${GITHUB_ACTION_PATH%/.github/actions/atelier}"
+        if [ ! -f "${root}/src/atelier/stream.py" ]; then
+          echo "::warning::Atelier root not found under ${GITHUB_ACTION_PATH}, streaming disabled"
+          root=""
+        fi
+        printf 'ATELIER_ROOT=%s\n' "${root}" >> "$GITHUB_ENV"
+
     - name: Pre Install Hook
       # consumer-supplied command, passed via env (not interpolated into the
-      # script body) so it cannot break out of the run. it is the first step and
+      # script body) so it cannot break out of the run. it is the first consumer-visible step and
       # carries no install-command guard, so it fires before the built-in or a
       # custom installer alike, on a fresh runner before disk reclaim
       if: ${{ inputs.pre-install != '' }}
@@ -81,6 +98,7 @@ runs:
         SANDBOX: ${{ runner.os == 'macOS' && 'relaxed' || 'true' }}
         EXTRA_CONF: ${{ inputs.extra-conf }}
         RULES: ${{ inputs.rules }}
+        POST_BUILD_HOOK: ${{ inputs.post-build-hook }}
       run: |
         set -euo pipefail
         # the nix.conf lines that apply whichever installer ran, so a custom
@@ -112,6 +130,10 @@ runs:
           fi
           if [ -n "${keys}" ]; then
             echo "extra-trusted-public-keys = ${keys}"
+          fi
+          # named before extra-conf so a consumer override wins (last wins)
+          if [ "${POST_BUILD_HOOK}" = "true" ]; then
+            echo "post-build-hook = /nix/var/atelier/hook.sh"
           fi
           # explicit if, not `[ -n ] && printf`, so an empty value does not trip
           # set -e on the trailing conditional
@@ -177,6 +199,24 @@ runs:
     - name: Create Build Dir
       shell: bash
       run: sudo mkdir -p /nix/build
+
+    - name: Install Post Build Hook
+      # after the installer because /nix does not exist on macos before it
+      # creates the volume. no build can run between daemon start and this
+      # step (the steps in between invoke no nix commands and the consumer
+      # post-install hook runs later), so the hook path named in nix.conf
+      # always resolves by the time a build finishes
+      if: ${{ inputs.post-build-hook == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # explicit modes, sudo inherits the caller's umask
+        # install -m /dev/null also truncates a spool surviving on a
+        # persistent /nix so old jobs' paths are not replayed
+        # the paths must match hook.sh and stream.py's ATELIER_SPOOL default
+        sudo mkdir -p -m 0755 /nix/var/atelier
+        sudo install -m 0755 "${GITHUB_ACTION_PATH}/hook.sh" /nix/var/atelier/hook.sh
+        sudo install -m 0644 /dev/null /nix/var/atelier/spool
 
     - name: Report Disk Space (Darwin)
       if: ${{ inputs.reclaim == 'true' && runner.os == 'macOS' }}

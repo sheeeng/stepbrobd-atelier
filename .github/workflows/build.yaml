@@ -117,8 +117,41 @@ jobs:
           rules: ${{ inputs.rules }}
           pre-install: ${{ inputs.pre-install }}
           post-install: ${{ inputs.post-install }}
+          post-build-hook: ${{ inputs.push && inputs.push-command == '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
+
+      # the streamer runs as the runner user with the step env, which is what
+      # keeps the secrets out of the root-run hook. it drains the spool the
+      # hook fills and pushes while the build runs. its stdout lands in a log
+      # file the final drain replays into the step log
+      - name: Start Cache Streamer
+        if: ${{ inputs.push && inputs.push-command == '' && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
+        shell: bash
+        env:
+          ATTIC_SERVER: ${{ vars.ATTIC_SERVER }}
+          ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          CACHIX_CACHE: ${{ vars.CACHIX_CACHE }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_SIGNING_KEY: ${{ secrets.CACHIX_SIGNING_KEY }}
+          NIKS3_SERVER: ${{ vars.NIKS3_SERVER }}
+          NIKS3_TOKEN: ${{ secrets.NIKS3_TOKEN }}
+        run: |
+          set -euo pipefail
+          # a missing root means setup could not find the atelier tree
+          if [ -z "${ATELIER_ROOT:-}" ]; then
+            echo "::warning::Skipping cache streamer: setup did not complete"
+            exit 0
+          fi
+          # a stale sentinel or pidfile from a prior job on a persistent
+          # runner must not stop or stall this job's streamer
+          rm -f "${RUNNER_TEMP}/atelier-stream.done" "${RUNNER_TEMP}/atelier-stream.pid"
+          python3 "${ATELIER_ROOT}/src/atelier/stream.py" --mode stream \
+            > "${RUNNER_TEMP}/atelier-stream.log" 2>&1 &
+          printf '%s' "$!" > "${RUNNER_TEMP}/atelier-stream.pid" \
+            || echo "::warning::Could not record the streamer pid"
 
       - name: Build
+        id: build
         if: ${{ matrix.installable != '' }}
         shell: bash
         run: |
@@ -126,13 +159,17 @@ jobs:
           nix build "${INSTALLABLE}^*" --no-link --print-build-logs 2>&1 | tee build.log
 
       # the push phase brackets pre-push, the push (built-in or custom), and
-      # post-push under one guard: a push was requested for a real, non-fork
-      # build. it deliberately omits the "a backend is configured" check the
-      # built-in push carries, so push-command and the hooks can target a cache
-      # atelier has no native support for. each step is env-passed and not
-      # interpolated into the run body so it cannot break out of the run
+      # post-push. with built-in backends the streamer has already been
+      # pushing during the build, and the final drain below re-pushes the
+      # full spool plus the outputs' closure as the backstop, also on a
+      # failed build (never on a cancelled or setup-failed cell) so partial
+      # results land on the cache. the pre/post hooks keep their success-only
+      # timing unless the built-in drain runs, and only for a real build
+      # failure (not a setup failure, where no push happens). each step is
+      # env-passed and not interpolated into the run body so it cannot break
+      # out of the run
       - name: Pre Push Hook
-        if: ${{ inputs.push && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && inputs.pre-push != '' }}
+        if: ${{ inputs.push && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && inputs.pre-push != '' && (success() || (!cancelled() && steps.build.outcome == 'failure' && inputs.push-command == '' && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != ''))) }}
         shell: bash
         env:
           PRE_PUSH: ${{ inputs.pre-push }}
@@ -149,9 +186,10 @@ jobs:
           bash -c "${PRE_PUSH}"
 
       - name: Push To Cache
-        if: ${{ inputs.push && inputs.push-command == '' && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
+        if: ${{ (success() || (!cancelled() && steps.build.outcome == 'failure')) && inputs.push && inputs.push-command == '' && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != '') }}
         shell: bash
         env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
           ATTIC_SERVER: ${{ vars.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
@@ -161,90 +199,13 @@ jobs:
           NIKS3_SERVER: ${{ vars.NIKS3_SERVER }}
           NIKS3_TOKEN: ${{ secrets.NIKS3_TOKEN }}
         run: |
-          set -uo pipefail
-
-          # only the outputs we just built
-          paths="$(nix build "${INSTALLABLE}^*" --no-link --print-out-paths)"
-          [ -n "$paths" ] || exit 0
-
-          # push to every configured backend, best-effort: each runs in its own
-          # subshell so one cannot abort the others, and a failed push only warns
-          # (the artifact is already built, so a cache upload hiccup must not fail
-          # the build). drop -e here so a failing backend falls through to the
-          # next; each subshell still runs set -euo pipefail, effective only
-          # because it runs as a plain statement whose status we read with $? -
-          # a "( set -e ... ) || warn" would disable that inner set -e (bash
-          # ignores -e set inside a command on the left of ||)
-          set +e
-
-          if [ -n "${ATTIC_SERVER}" ] && [ -n "${ATTIC_CACHE}" ]; then
-            (
-              set -euo pipefail
-              # lix only has 'install', on cppnix it is a deprecated alias for
-              # 'add'. revert to 'add' once lix supports 'add'
-              nix profile install nixpkgs#attic-client
-              attic login default "${ATTIC_SERVER}" "${ATTIC_TOKEN}"
-              # a missing or unreachable cache is a soft skip, not a build failure
-              attic cache info "${ATTIC_CACHE}" || { echo "::warning::Attic cache unavailable, skipping"; exit 0; }
-              # shellcheck disable=SC2086
-              attic push "${ATTIC_CACHE}" $paths
-            )
-            # shellcheck disable=SC2181
-            [ $? -eq 0 ] || echo "::warning::Attic push failed"
+          set -euo pipefail
+          # a failed setup leaves no atelier checkout, skip rather than error
+          if [ -z "${ATELIER_ROOT:-}" ]; then
+            echo "::warning::Skipping cache push: setup did not complete"
+            exit 0
           fi
-
-          if [ -n "${CACHIX_CACHE}" ]; then
-            (
-              set -euo pipefail
-              # lix only has 'install', on cppnix it is a deprecated alias for
-              # 'add'. revert to 'add' once lix supports 'add'
-              nix profile install nixpkgs#cachix
-              [ -n "${CACHIX_SIGNING_KEY:-}" ] || unset CACHIX_SIGNING_KEY
-              # shellcheck disable=SC2086
-              printf '%s\n' $paths | cachix push "${CACHIX_CACHE}"
-            )
-            # shellcheck disable=SC2181
-            [ $? -eq 0 ] || echo "::warning::Cachix push failed"
-          fi
-
-          if [ -n "${NIKS3_SERVER}" ]; then
-            (
-              set -euo pipefail
-              # nixpkgs niks3 lags at 1.4.0 (no --auth-token-{path,script})
-              # use my pinned niks3
-              # lix only has 'install', on cppnix it is a deprecated alias for
-              # 'add'. revert to 'add' once lix supports 'add'
-              nix profile install github:stepbrobd/inc#niks3
-              if [ -n "${NIKS3_TOKEN:-}" ]; then
-                # token auth: write the secret to a private file, pass its path
-                tok="$(mktemp)"
-                (umask 077; printf '%s' "${NIKS3_TOKEN}" > "$tok")
-                # shellcheck disable=SC2086
-                niks3 push --server-url "${NIKS3_SERVER}" --auth-token-path "$tok" $paths
-              elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-                # oidc auth: the audience must match what the server validates the jwt against
-                aud="$(curl -sf "${NIKS3_SERVER}/api/cache-config?issuer=https://token.actions.githubusercontent.com" | jq -r '.oidc_audience // empty')"
-                if [ -z "$aud" ]; then
-                  echo "::warning::Skipping niks3 push: server advertises no oidc_audience for the GitHub issuer; configure a GitHub OIDC provider on the server"
-                else
-                  # niks3 reruns this script to refresh the token; leave the github
-                  # oidc env vars unexpanded so they are read at each mint, not now
-                  s="$(mktemp)"
-                  printf '%s\n' \
-                    '#!/bin/sh' \
-                    "exec curl -sf -H \"Authorization: Bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN\" \"\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${aud}\" | jq '{token: .value, expires_at: ((now + 240) | todateiso8601)}'" \
-                    > "$s"
-                  chmod 700 "$s"
-                  # shellcheck disable=SC2086
-                  niks3 push --server-url "${NIKS3_SERVER}" --auth-token-script "$s" $paths
-                fi
-              else
-                echo "::warning::Skipping niks3 push: OIDC needs 'id-token: write' in the caller workflow"
-              fi
-            )
-            # shellcheck disable=SC2181
-            [ $? -eq 0 ] || echo "::warning::niks3 push failed"
-          fi
+          python3 "${ATELIER_ROOT}/src/atelier/stream.py" --mode final || echo "::warning::Cache push failed"
 
       # custom push replaces the built-in one (like install-command replaces the
       # installer): when set, the native Push To Cache above is skipped. the
@@ -269,7 +230,7 @@ jobs:
           bash -c "${PUSH_COMMAND}"
 
       - name: Post Push Hook
-        if: ${{ inputs.push && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && inputs.post-push != '' }}
+        if: ${{ inputs.push && matrix.installable != '' && github.event.pull_request.head.repo.fork != true && inputs.post-push != '' && (success() || (!cancelled() && steps.build.outcome == 'failure' && inputs.push-command == '' && ((vars.ATTIC_SERVER != '' && vars.ATTIC_CACHE != '') || vars.CACHIX_CACHE != '' || vars.NIKS3_SERVER != ''))) }}
         shell: bash
         env:
           POST_PUSH: ${{ inputs.post-push }}
