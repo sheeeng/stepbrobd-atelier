@@ -105,28 +105,48 @@ def excluded(path: str, rules: Rules) -> bool:
     return any(matches(pattern, path) for pattern in rules.exclude)
 
 
-def prunable_excludes(rules: Rules) -> dict[str, dict[str, list[str]]]:
-    """Exact leaf names droppable before evaluation, grouped by set then system.
+def prunable_excludes(rules: Rules) -> dict[str, dict[str, dict[str, Any]]]:
+    """Exclude trees droppable before evaluation, grouped by set then system.
 
-    Handles ``<set>.<sys>.<leaf>`` excludes where ``<sys>`` is ``*`` (all systems)
-    or a literal system, and ``<leaf>`` is literal (no glob metacharacters). The
-    select expression ``removeAttrs`` them so nix-eval-jobs never forces, fetches,
-    or builds an excluded attribute. Broader globs stay post-eval filters.
+    Handles ``<set>.<sys>.<path...>`` excludes where ``<sys>`` is ``*`` (all
+    systems) or a literal system and every path segment is literal (no glob
+    metacharacters), at any depth. A trailing ``**`` also qualifies because the
+    parent it names is an attrset and never buildable itself, so dropping the
+    parent removes exactly the leaves the glob would drop after evaluation. The
+    select expression ``removeAttrs`` the marked names while it recurses, so
+    nix-eval-jobs never forces, fetches, or builds an excluded attribute. Any
+    other glob stays a post-eval filter.
 
-    Shape: ``{set: {("*" | system): [leaf, ...]}}``.
+    Shape: ``{set: {("*" | system): tree}}`` where a tree maps an attribute name
+    to ``True`` (drop it and everything below) or to a subtree to descend into.
+    ``True`` wins over a subtree when rules overlap, since dropping the parent
+    already drops every descendant.
     """
-    out: dict[str, dict[str, list[str]]] = {}
+    out: dict[str, dict[str, dict[str, Any]]] = {}
     for pattern in rules.exclude:
         parts = pattern.split(".")
-        if len(parts) != 3 or parts[0] not in PER_SYSTEM_SETS:
+        if len(parts) < 3 or parts[0] not in PER_SYSTEM_SETS:
             continue
-        system, leaf = parts[1], parts[2]
-        if _GLOB_CHARS & set(leaf):
-            continue
+        system = parts[1]
         if system != "*" and _GLOB_CHARS & set(system):
             continue
-        out.setdefault(parts[0], {}).setdefault(system, []).append(leaf)
-    return {
-        output: {system: sorted(set(leaves)) for system, leaves in by_system.items()}
-        for output, by_system in out.items()
-    }
+        path = parts[2:]
+        # a trailing ** means drop the parent attrset wholesale
+        # a bare "<set>.<sys>.**" is left to the post filter, dropping the whole
+        # system root would mean not rooting it at all
+        if path[-1] == "**":
+            path = path[:-1]
+        if not path or any(_GLOB_CHARS & set(seg) for seg in path):
+            continue
+        node = out.setdefault(parts[0], {}).setdefault(system, {})
+        for seg in path[:-1]:
+            nxt = node.get(seg)
+            if nxt is True:
+                # an ancestor is already dropped, the deeper rule is redundant
+                break
+            if not isinstance(nxt, dict):
+                nxt = node[seg] = {}
+            node = nxt
+        else:
+            node[path[-1]] = True
+    return out

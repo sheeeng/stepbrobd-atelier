@@ -159,10 +159,42 @@ def test_prunable_excludes_groups_by_set_and_system() -> None:
             "legacyPackages.*.spotify",
             "legacyPackages.aarch64-darwin.bird3",  # specific system, prunable
             "legacyPackages.*.ripe-atlas-*",  # glob leaf, stays a post filter
-            "legacyPackages.*.ocamlPackages.*",  # nested, stays a post filter
+            "legacyPackages.*.ocamlPackages.*",  # glob descendant, stays a post filter
             "nixosConfigurations.host",  # not a per system set
         ),
     )
     assert prunable_excludes(rules) == {
-        "legacyPackages": {"*": ["spotify", "verus"], "aarch64-darwin": ["bird3"]}
+        "legacyPackages": {
+            "*": {"spotify": True, "verus": True},
+            "aarch64-darwin": {"bird3": True},
+        }
     }
+
+
+def test_prunable_excludes_handles_nested_literals_and_trailing_globstar() -> None:
+    rules = Rules(
+        systems=(),
+        include=(),
+        exclude=(
+            "legacyPackages.*.ocamlPackages.yocaml_unix",  # nested literal, prunable
+            "legacyPackages.*.rocqPackages.**",  # drop the whole scope pre eval
+            "legacyPackages.*.**",  # whole system root, stays a post filter
+            "legacyPackages.**.x",  # mid path globstar, stays a post filter
+        ),
+    )
+    assert prunable_excludes(rules) == {
+        "legacyPackages": {
+            "*": {"ocamlPackages": {"yocaml_unix": True}, "rocqPackages": True}
+        }
+    }
+
+
+def test_prunable_excludes_parent_drop_beats_subtree() -> None:
+    # dropping the parent already drops every descendant, so the parent rule
+    # must win regardless of the order the two rules appear in
+    deep = "legacyPackages.*.ocamlPackages.yocaml_unix"
+    whole = "legacyPackages.*.ocamlPackages.**"
+    want = {"legacyPackages": {"*": {"ocamlPackages": True}}}
+    for exclude in ((deep, whole), (whole, deep)):
+        rules = Rules(systems=(), include=(), exclude=exclude)
+        assert prunable_excludes(rules) == want

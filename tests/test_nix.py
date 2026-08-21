@@ -216,27 +216,40 @@ def test_build_select_guards_leaf_derivations() -> None:
     assert "is not a derivation" in expr
 
 
-def test_build_select_prunes_excluded_leaves() -> None:
+def test_build_select_prunes_excluded_trees() -> None:
+    # "*" rules fold into each requested system and a system nobody asked for
+    # is dropped, so the embedded nix reads one tree per rooted "<set>.<sys>"
     expr = _build_select(
-        ["x86_64-linux"],
+        ["x86_64-linux", "aarch64-darwin"],
         ["legacyPackages"],
         [],
-        exclude_leaves={
-            "legacyPackages": {"*": ["spotify", "verus"], "aarch64-darwin": ["bird3"]}
+        excludes={
+            "legacyPackages": {
+                "*": {"spotify": True, "ocamlPackages": {"yocaml_unix": True}},
+                "aarch64-darwin": {"bird3": True},
+                "aarch64-linux": {"cider-2": True},
+            }
         },
     )
     assert "removeAttrs" in expr
-    assert '"*" = [ "spotify" "verus" ];' in expr
-    assert '"aarch64-darwin" = [ "bird3" ];' in expr
+    assert (
+        '"x86_64-linux" = { "ocamlPackages" = { "yocaml_unix" = true; };'
+        ' "spotify" = true; };' in expr
+    )
+    assert (
+        '"aarch64-darwin" = { "bird3" = true;'
+        ' "ocamlPackages" = { "yocaml_unix" = true; }; "spotify" = true; };' in expr
+    )
+    assert "cider-2" not in expr
 
 
-def test_build_select_escapes_exclude_leaves() -> None:
-    # a crafted leaf name must stay inside its nix string, not break out
+def test_build_select_escapes_exclude_names() -> None:
+    # a crafted attribute name must stay inside its nix string, not break out
     expr = _build_select(
         ["x86_64-linux"],
         ["legacyPackages"],
         [],
-        exclude_leaves={"legacyPackages": {"*": ['evil"; x']}},
+        excludes={"legacyPackages": {"*": {'evil"; x': True}}},
     )
     assert '"evil\\"; x"' in expr
 
@@ -249,5 +262,55 @@ def test_build_select_rejects_unknown_exclude_set() -> None:
             ["x86_64-linux"],
             ["legacyPackages"],
             [],
-            exclude_leaves={"bogus": {"*": ["x"]}},
+            excludes={"bogus": {"*": {"x": True}}},
         )
+
+
+def test_select_drops_excluded_subtrees_without_forcing() -> None:
+    # the excluded attributes throw when forced, so the eval succeeding at all
+    # proves the prune happens before classification can touch them, and the
+    # surviving attrNames prove exactly the excluded names disappeared
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("nix") is None:
+        pytest.skip("nix not on PATH")
+    select = _build_select(
+        ["x86_64-linux"],
+        ["legacyPackages"],
+        [],
+        excludes={
+            "legacyPackages": {
+                "*": {"spotify": True, "ocamlPackages": {"yocaml_unix": True}}
+            }
+        },
+    )
+    flake = """
+      {
+        outputs.legacyPackages.x86_64-linux = {
+          caddy = { type = "derivation"; name = "caddy"; };
+          spotify = throw "forced an excluded attribute";
+          ocamlPackages = {
+            yocaml = { type = "derivation"; name = "yocaml"; };
+            yocaml_unix = throw "forced an excluded attribute";
+          };
+        };
+      }
+    """
+    expr = f"""
+      let s = ({select}) ({flake}); r = s."legacyPackages.x86_64-linux"; in
+      {{ top = builtins.attrNames r; ocaml = builtins.attrNames r.ocamlPackages; }}
+    """
+    proc = subprocess.run(
+        ["nix", "eval", "--json", "--expr", expr],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(proc.stdout) == {
+        "top": ["caddy", "ocamlPackages"],
+        "ocaml": ["yocaml"],
+    }

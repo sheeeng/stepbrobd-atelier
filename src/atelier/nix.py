@@ -35,8 +35,11 @@ let
   perSystemSets = [ @PER_SYSTEM@ ];
   configSets = [ @CONFIG@ ];
   leafSets = [ @LEAF@ ];
-  # exact leaf names per set to drop before recursing, so nix-eval-jobs never
-  # forces (and never fetches or builds) a manually excluded attribute
+  # nested exclude trees per set and rooted system, "*" rules already folded
+  # into each concrete system by the generator
+  # a true leaf drops the attribute and everything below it before recursion
+  # an attrset descends alongside the scope so nix-eval-jobs never forces
+  # (and never fetches or builds) a manually excluded attribute at any depth
   excludes = { @EXCLUDES@ };
   # the deepest attribute path the include globs can match; recursion below it can
   # never be selected, so it stops there (a `**` glob raises this to a hard cap).
@@ -54,8 +57,12 @@ let
   # so nix-eval-jobs reports it as that attribute's own eval error rather than
   # dropping it silently. forcing a child to classify it stays inside tryEval, so
   # a broken attribute cannot abort the whole evaluation
-  sanitize = remaining: set:
-    let cleaned = builtins.removeAttrs set denylist;
+  # excl is this level's exclude tree, its true entries are removed before any
+  # probe can force them and its subtrees descend with the recursion
+  sanitize = remaining: excl: set:
+    let
+      dropped = builtins.filter (n: excl.${n} == true) (builtins.attrNames excl);
+      cleaned = builtins.removeAttrs set (denylist ++ dropped);
     in builtins.listToAttrs (builtins.concatMap (name:
       let
         raw = cleaned.${name};
@@ -70,13 +77,13 @@ let
         if kind == "drv" || kind == "throws"
         then [ { inherit name; value = raw; } ]
         else if kind == "attrs" && remaining > 0
-        then [ { inherit name; value = sanitize (remaining - 1) raw; } ]
+        then [ { inherit name; value = sanitize (remaining - 1) (excl.${name} or { }) raw; } ]
         else [ ]
     ) (builtins.attrNames cleaned));
   ps = builtins.foldl' (acc: set:
         builtins.foldl' (a: sys:
           if (o ? ${set}) && (o.${set} ? ${sys})
-          then a // { "${set}.${sys}" = sanitize startDepth (builtins.removeAttrs o.${set}.${sys} ((excludes.${set}.${sys} or [ ]) ++ (excludes.${set}."*" or [ ]))); }
+          then a // { "${set}.${sys}" = sanitize startDepth (excludes.${set}.${sys} or { }) o.${set}.${sys}; }
           else a
         ) acc systems
       ) { } perSystemSets;
@@ -117,18 +124,52 @@ def _nix_list(items: Sequence[str]) -> str:
     return " ".join(_nix_str(item) for item in items)
 
 
-def _nix_excludes(exclude_leaves: Mapping[str, Mapping[str, Sequence[str]]]) -> str:
-    """Render ``"set" = { "sys" = [ "leaf" ... ]; ... };`` for the ``excludes`` attrset.
+def _merge_trees(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge two exclude trees, ``True`` beating a subtree on overlapping names.
 
-    ``sys`` is either ``"*"`` (drop from every system) or a specific system.
+    Dropping a parent already drops every descendant, so a ``True`` from either
+    side must survive a subtree from the other.
+    """
+    out: dict[str, Any] = dict(base)
+    for name, sub in extra.items():
+        cur = out.get(name)
+        if sub is True or cur is True:
+            out[name] = True
+        elif cur is None:
+            out[name] = sub
+        else:
+            out[name] = _merge_trees(cur, sub)
+    return out
+
+
+def _nix_tree(tree: Mapping[str, Any]) -> str:
+    """Render an exclude tree as a nix attrset literal, names escaped and sorted."""
+    pairs = " ".join(
+        f"{_nix_str(name)} = {'true' if sub is True else _nix_tree(sub)};"
+        for name, sub in sorted(tree.items())
+    )
+    return f"{{ {pairs} }}" if pairs else "{ }"
+
+
+def _nix_excludes(
+    excludes: Mapping[str, Mapping[str, Mapping[str, Any]]], systems: Sequence[str]
+) -> str:
+    """Render ``"set" = { "sys" = <tree>; ... };`` for the ``excludes`` attrset.
+
+    A ``"*"`` entry (drop from every system) is folded into each requested
+    system here, so the embedded nix reads exactly one tree per rooted
+    ``<set>.<sys>`` and never merges.
     """
     sets = []
-    for set_name, by_system in exclude_leaves.items():
-        pairs = " ".join(
-            f"{_nix_str(system)} = [ {_nix_list(leaves)} ];"
-            for system, leaves in by_system.items()
-        )
-        sets.append(f"{_nix_str(set_name)} = {{ {pairs} }};")
+    for set_name, by_system in sorted(excludes.items()):
+        star = by_system.get("*", {})
+        pairs = []
+        for system in systems:
+            tree = _merge_trees(by_system.get(system, {}), star)
+            if tree:
+                pairs.append(f"{_nix_str(system)} = {_nix_tree(tree)};")
+        if pairs:
+            sets.append(f"{_nix_str(set_name)} = {{ {' '.join(pairs)} }};")
     return " ".join(sets)
 
 
@@ -137,7 +178,7 @@ def _build_select(
     per_system_sets: Sequence[str],
     config_sets: Sequence[str],
     leaf_sets: Sequence[str] = (),
-    exclude_leaves: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    excludes: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     max_depth: int = MAX_RECURSE_DEPTH,
 ) -> str:
     # fail closed if an unallowlisted value ever reaches the embedded nix
@@ -153,9 +194,9 @@ def _build_select(
             and output not in LEAF_SETS
         ):
             raise ValueError(f"unknown output set {output!r}")
-    leaves = exclude_leaves or {}
-    # set names are allowlisted, leaf names are escaped (they are arbitrary)
-    for output in leaves:
+    trees = excludes or {}
+    # set names are allowlisted, tree names are escaped (they are arbitrary)
+    for output in trees:
         if output not in PER_SYSTEM_SETS:
             raise ValueError(f"unknown output set {output!r}")
     return (
@@ -163,7 +204,7 @@ def _build_select(
         .replace("@PER_SYSTEM@", _nix_list(per_system_sets))
         .replace("@CONFIG@", _nix_list(config_sets))
         .replace("@LEAF@", _nix_list(leaf_sets))
-        .replace("@EXCLUDES@", _nix_excludes(leaves))
+        .replace("@EXCLUDES@", _nix_excludes(trees, systems))
         # an int, so it cannot carry an injection; clamped to the hard cap
         .replace("@MAXDEPTH@", str(min(int(max_depth), MAX_RECURSE_DEPTH)))
         .replace("@DENYLIST@", _nix_list(SCOPE_DENYLIST))
@@ -216,7 +257,7 @@ def evaluate(
     config_sets: Sequence[str],
     leaf_sets: Sequence[str] = (),
     workers: int = 4,
-    exclude_leaves: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    excludes: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     substituters: Iterable[str] = (),
     max_depth: int = MAX_RECURSE_DEPTH,
 ) -> list[dict[str, Any]]:
@@ -224,14 +265,14 @@ def evaluate(
 
     Per attribute eval errors are reported inline as objects carrying an `error`
     field and never abort the run. A non zero exit is a fatal evaluation failure
-    of the whole flake and is raised. `exclude_leaves` names attributes pruned
-    before recursion so they are never evaluated, fetched, or built.
+    of the whole flake and is raised. `excludes` holds the exclude trees pruned
+    during recursion so a marked attribute is never evaluated, fetched, or built.
     `substituters` are the caches each attribute's cache status is checked against.
     `max_depth` bounds the per system scope recursion to the include globs' depth,
     so a re-exported package set is not force-recursed into the whole nixpkgs lib.
     """
     select = _build_select(
-        systems, per_system_sets, config_sets, leaf_sets, exclude_leaves, max_depth
+        systems, per_system_sets, config_sets, leaf_sets, excludes, max_depth
     )
     cmd = _eval_command(flake, select, workers, substituters)
     # capture stdout (the json results) but let stderr stream to the log live,
