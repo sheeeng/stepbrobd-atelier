@@ -91,15 +91,27 @@ segment. Thus `legacyPackages.*.*` matches `legacyPackages.x86_64-linux.caddy`
 but not `legacyPackages.x86_64-linux.ocamlPackages.dune`, which needs the
 explicit `legacyPackages.*.ocamlPackages.*`.
 
+A `**` segment spans any number of segments (0 segment included), e.g.
+`legacyPackages.*.**` matches all attribute under a system at any nesting depth,
+and `legacyPackages.*.ocamlPackages.**` matches the scope itself and everything
+below it. `**` spans segments only when it is a whole segment. Inside a segment
+it degrades to fnmatch's `*` and stops at the next dot, i.e. `foo**` is
+equivalent to `foo*`.
+
 `packages`, `legacyPackages`, `checks` and `devShells` are addressed per system
 as `<set>.<system>.<rest>`. `nixosConfigurations` and `darwinConfigurations` are
 addressed by host as `<set>.<host>` and built through their
 `config.system.build.toplevel`. `formatter` is the derivation itself per system,
 addressed as `formatter.<system>`.
 
-Manual excludes drop an attribute entirely. Broken and unsupported-platform
-attributes are detected from their eval error and reported as a skipped check
-rather than a build failure.
+Manual excludes drop an attribute from evaluation entirely. An exclude whose
+system segment is `*` or literal and whose remaining segments are literal, with
+or without a trailing `**`, will be removed from the scope before evaluation, so
+the attribute is never evaluated, fetched, or built and will silent broken
+derivation eval error. Every other glob is filtered after evaluation, which
+drops the attribute from the build matrix but still evaluates it. Broken and
+unsupported-platform attributes are detected from their eval error and reported
+as a skipped check rather than a build failure.
 
 ### Example
 
@@ -124,7 +136,8 @@ include = [
 ]
 
 exclude = [
-  "legacyPackages.*.spotify", # unfree
+  "legacyPackages.*.spotify",          # unfree
+  "legacyPackages.*.rocqPackages.**",  # a scope and everything below it
 ]
 ```
 
