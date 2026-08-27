@@ -243,6 +243,8 @@ def test_build_select_prunes_excluded_trees() -> None:
     assert "cider-2" not in expr
 
 
+
+
 def test_build_select_escapes_exclude_names() -> None:
     # a crafted attribute name must stay inside its nix string, not break out
     expr = _build_select(
@@ -284,7 +286,11 @@ def test_select_drops_excluded_subtrees_without_forcing() -> None:
         [],
         excludes={
             "legacyPackages": {
-                "*": {"spotify": True, "ocamlPackages": {"yocaml_unix": True}}
+                "*": {
+                    "@MAXDEPTH@": True,
+                    "spotify": True,
+                    "ocamlPackages": {"yocaml_unix": True},
+                }
             }
         },
     )
@@ -292,6 +298,7 @@ def test_select_drops_excluded_subtrees_without_forcing() -> None:
       {
         outputs.legacyPackages.x86_64-linux = {
           caddy = { type = "derivation"; name = "caddy"; };
+          "@MAXDEPTH@" = throw "forced a token-shaped excluded attribute";
           spotify = throw "forced an excluded attribute";
           ocamlPackages = {
             yocaml = { type = "derivation"; name = "yocaml"; };
@@ -314,3 +321,54 @@ def test_select_drops_excluded_subtrees_without_forcing() -> None:
         "top": ["caddy", "ocamlPackages"],
         "ocaml": ["yocaml"],
     }
+
+
+def test_select_drops_excluded_configs_without_forcing() -> None:
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("nix") is None:
+        pytest.skip("nix not on PATH")
+    select = _build_select(
+        ["x86_64-linux"],
+        [],
+        ["nixosConfigurations"],
+        excludes={"nixosConfigurations": {"*": {"iso": True}}},
+    )
+    flake = """
+      {
+        outputs.nixosConfigurations = {
+          baldy.config.system.build.toplevel = { type = "derivation"; name = "toplevel"; };
+          iso = throw "forced an excluded configuration";
+        };
+      }
+    """
+    expr = f"""
+      let s = ({select}) ({flake}); r = s.nixosConfigurations; in
+      {{ hosts = builtins.attrNames r; kept = r.baldy.name; }}
+    """
+    proc = subprocess.run(
+        ["nix", "eval", "--json", "--expr", expr],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(proc.stdout) == {"hosts": ["baldy"], "kept": "toplevel"}
+
+
+def test_select_template_resource_parses() -> None:
+    import shutil
+    import subprocess
+    from importlib import resources
+
+    import pytest
+
+    if shutil.which("nix-instantiate") is None:
+        pytest.skip("nix-instantiate not on PATH")
+    with resources.as_file(resources.files("atelier") / "select.nix") as path:
+        subprocess.run(
+            ["nix-instantiate", "--parse", str(path)], capture_output=True, check=True
+        )

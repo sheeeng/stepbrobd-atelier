@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from atelier.types import (
+    CONFIG_SETS,
     DEFAULT_INCLUDE,
     DEFAULT_SYSTEMS,
     MAX_RECURSE_DEPTH,
@@ -134,6 +135,10 @@ def prunable_excludes(rules: Rules) -> dict[str, dict[str, dict[str, Any]]]:
     nix-eval-jobs never forces, fetches, or builds an excluded attribute. Any
     other glob stays a post-eval filter.
 
+    A literal config host (``<set>.<host>``), optionally followed by ``**``,
+    is stored in the ``"*"`` tree because hosts have no system dimension. Other
+    config patterns remain filters applied after evaluation.
+
     Shape: ``{set: {("*" | system): tree}}`` where a tree maps an attribute name
     to ``True`` (drop it and everything below) or to a subtree to descend into.
     ``True`` wins over a subtree when rules overlap, since dropping the parent
@@ -142,10 +147,17 @@ def prunable_excludes(rules: Rules) -> dict[str, dict[str, dict[str, Any]]]:
     out: dict[str, dict[str, dict[str, Any]]] = {}
     for pattern in rules.exclude:
         parts = pattern.split(".")
+        if parts[0] in CONFIG_SETS:
+            path = parts[1:]
+            if path and path[-1] == "**":
+                path = path[:-1]
+            if len(path) == 1 and _GLOB_CHARS.isdisjoint(path[0]):
+                out.setdefault(parts[0], {}).setdefault("*", {})[path[0]] = True
+            continue
         if len(parts) < 3 or parts[0] not in PER_SYSTEM_SETS:
             continue
         system = parts[1]
-        if system != "*" and _GLOB_CHARS & set(system):
+        if system != "*" and not _GLOB_CHARS.isdisjoint(system):
             continue
         path = parts[2:]
         # a trailing ** means drop the parent attrset wholesale
@@ -153,7 +165,7 @@ def prunable_excludes(rules: Rules) -> dict[str, dict[str, dict[str, Any]]]:
         # system root would mean not rooting it at all
         if path[-1] == "**":
             path = path[:-1]
-        if not path or any(_GLOB_CHARS & set(seg) for seg in path):
+        if not path or any(not _GLOB_CHARS.isdisjoint(seg) for seg in path):
             continue
         node = out.setdefault(parts[0], {}).setdefault(system, {})
         for seg in path[:-1]:

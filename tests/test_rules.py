@@ -195,14 +195,33 @@ def test_prunable_excludes_groups_by_set_and_system() -> None:
             "legacyPackages.aarch64-darwin.bird3",  # specific system, prunable
             "legacyPackages.*.ripe-atlas-*",  # glob leaf, stays a post filter
             "legacyPackages.*.ocamlPackages.*",  # glob descendant, stays a post filter
-            "nixosConfigurations.host",  # not a per system set
+            "nixosConfigurations.host",  # config set, hosts collect under "*"
         ),
     )
     assert prunable_excludes(rules) == {
         "legacyPackages": {
             "*": {"spotify": True, "verus": True},
             "aarch64-darwin": {"bird3": True},
-        }
+        },
+        "nixosConfigurations": {"*": {"host": True}},
+    }
+
+
+def test_prunable_excludes_config_hosts() -> None:
+    rules = Rules(
+        systems=(),
+        include=(),
+        exclude=(
+            "nixosConfigurations.iso",
+            "darwinConfigurations.laptop.**",
+            "nixosConfigurations.cloud-*",  # glob host, stays a post filter
+            "nixosConfigurations.iso.config",  # deeper than a host, prunes nothing
+            "nixosConfigurations.**",  # whole set root, stays a post filter
+        ),
+    )
+    assert prunable_excludes(rules) == {
+        "nixosConfigurations": {"*": {"iso": True}},
+        "darwinConfigurations": {"*": {"laptop": True}},
     }
 
 

@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
+from importlib import resources
 from typing import Any
 
 from atelier.types import (
@@ -17,97 +18,9 @@ from atelier.types import (
 
 _SKIP_RE = re.compile(SKIP_PATTERN, re.IGNORECASE)
 
-# embedded nix that roots the requested output sets into one attrset for
-# nix-eval-jobs to recurse
-#   per system sets become   "<set>.<system>" = sanitize flake.<set>.<system>
-#   config sets become       "<set>"          = mapAttrs toplevel flake.<set>
-#   leaf sets become         "<set>.<system>" = flake.<set>.<system> (a drv)
-# per system sets are sanitized first: a re-exported nixpkgs package set carries
-# scope plumbing (the whole `lib`, callPackage/newScope functions, a self
-# referential alias) that force-recurse would otherwise dive into, burning the
-# runner's memory until it is OOM killed. sanitize prunes that plumbing and bounds
-# the recursion to the include globs' depth, leaving only buildable leaves.
-# the @TOKENS@ are replaced with allowlisted nix string lists, never raw input
-_SELECT_TEMPLATE = r"""flake:
-let
-  o = flake.outputs;
-  systems = [ @SYSTEMS@ ];
-  perSystemSets = [ @PER_SYSTEM@ ];
-  configSets = [ @CONFIG@ ];
-  leafSets = [ @LEAF@ ];
-  # nested exclude trees per set and rooted system, "*" rules already folded
-  # into each concrete system by the generator
-  # a true leaf drops the attribute and everything below it before recursion
-  # an attrset descends alongside the scope so nix-eval-jobs never forces
-  # (and never fetches or builds) a manually excluded attribute at any depth
-  excludes = { @EXCLUDES@ };
-  # the deepest attribute path the include globs can match; recursion below it can
-  # never be selected, so it stops there (a `**` glob raises this to a hard cap).
-  # a per system set roots at "<set>.<sys>" (two path segments), so its children
-  # are at depth three and the remaining attrset recursion budget is maxDepth - 3
-  maxDepth = @MAXDEPTH@;
-  startDepth = if maxDepth > 3 then maxDepth - 3 else 0;
-  # scope-internal attrset names that are never buildable; function valued plumbing
-  # is dropped structurally below, so this only names the attrset valued plumbing
-  denylist = [ @DENYLIST@ ];
-  # prune scope plumbing before nix-eval-jobs force-recurses: keep derivations as
-  # leaves, drop functions (callPackage, newScope, ...) and self referential
-  # aliases (recurseForDerivations = false), recurse plain attrsets only while the
-  # include depth can still match, and keep an attr that throws on classification
-  # so nix-eval-jobs reports it as that attribute's own eval error rather than
-  # dropping it silently. forcing a child to classify it stays inside tryEval, so
-  # a broken attribute cannot abort the whole evaluation
-  # excl is this level's exclude tree, its true entries are removed before any
-  # probe can force them and its subtrees descend with the recursion
-  sanitize = remaining: excl: set:
-    let
-      dropped = builtins.filter (n: excl.${n} == true) (builtins.attrNames excl);
-      cleaned = builtins.removeAttrs set (denylist ++ dropped);
-    in builtins.listToAttrs (builtins.concatMap (name:
-      let
-        raw = cleaned.${name};
-        probe = builtins.tryEval (
-          if builtins.isFunction raw then "fn"
-          else if (raw.type or null) == "derivation" then "drv"
-          else if builtins.isAttrs raw then
-            (if (raw.recurseForDerivations or true) == false then "norec" else "attrs")
-          else "other");
-        kind = if probe.success then probe.value else "throws";
-      in
-        if kind == "drv" || kind == "throws"
-        then [ { inherit name; value = raw; } ]
-        else if kind == "attrs" && remaining > 0
-        then [ { inherit name; value = sanitize (remaining - 1) (excl.${name} or { }) raw; } ]
-        else [ ]
-    ) (builtins.attrNames cleaned));
-  ps = builtins.foldl' (acc: set:
-        builtins.foldl' (a: sys:
-          if (o ? ${set}) && (o.${set} ? ${sys})
-          then a // { "${set}.${sys}" = sanitize startDepth (excludes.${set}.${sys} or { }) o.${set}.${sys}; }
-          else a
-        ) acc systems
-      ) { } perSystemSets;
-  cs = builtins.foldl' (acc: set:
-        if o ? ${set}
-        then acc // { "${set}" = builtins.mapAttrs (_: c: c.config.system.build.toplevel) o.${set}; }
-        else acc
-      ) { } configSets;
-  # a leaf set's system attribute is the derivation itself, so it roots
-  # directly with nothing below it to recurse into or prune. a non derivation
-  # value (a schema violation) throws lazily so it surfaces as that attribute's
-  # eval error instead of being recursed into and silently dropped
-  ls = builtins.foldl' (acc: set:
-        builtins.foldl' (a: sys:
-          if (o ? ${set}) && (o.${set} ? ${sys})
-          then a // { "${set}.${sys}" =
-            let v = o.${set}.${sys}; in
-            if (v.type or null) == "derivation" then v
-            else throw "flake output ${set}.${sys} is not a derivation"; }
-          else a
-        ) acc systems
-      ) { } leafSets;
-in ps // cs // ls
-"""
+# quoted placeholders keep select.nix parseable before substitution
+# generated literals contain only allowlisted or escaped values
+_SELECT_TEMPLATE = (resources.files("atelier") / "select.nix").read_text()
 
 
 def _nix_str(value: str) -> str:
@@ -154,15 +67,18 @@ def _nix_tree(tree: Mapping[str, Any]) -> str:
 def _nix_excludes(
     excludes: Mapping[str, Mapping[str, Mapping[str, Any]]], systems: Sequence[str]
 ) -> str:
-    """Render ``"set" = { "sys" = <tree>; ... };`` for the ``excludes`` attrset.
+    """Render exclude trees as a Nix attrset.
 
-    A ``"*"`` entry (drop from every system) is folded into each requested
-    system here, so the embedded nix reads exactly one tree per rooted
-    ``<set>.<sys>`` and never merges.
+    Per system sets contain one tree per requested system after folding ``"*"``.
+    Configuration sets contain the flat ``"*"`` host tree.
     """
     sets = []
     for set_name, by_system in sorted(excludes.items()):
         star = by_system.get("*", {})
+        if set_name in CONFIG_SETS:
+            if star:
+                sets.append(f"{_nix_str(set_name)} = {_nix_tree(star)};")
+            continue
         pairs = []
         for system in systems:
             tree = _merge_trees(by_system.get(system, {}), star)
@@ -170,7 +86,8 @@ def _nix_excludes(
                 pairs.append(f"{_nix_str(system)} = {_nix_tree(tree)};")
         if pairs:
             sets.append(f"{_nix_str(set_name)} = {{ {' '.join(pairs)} }};")
-    return " ".join(sets)
+    rendered = " ".join(sets)
+    return f"{{ {rendered} }}" if rendered else "{ }"
 
 
 def _build_select(
@@ -181,9 +98,7 @@ def _build_select(
     excludes: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
     max_depth: int = MAX_RECURSE_DEPTH,
 ) -> str:
-    # fail closed if an unallowlisted value ever reaches the embedded nix
-    # the discover layer already filters these, this guards against a future
-    # refactor dropping that filtering and allowing nix injection
+    # revalidate discovery values before embedding them in the expression
     for system in systems:
         if system not in RUNNERS:
             raise ValueError(f"unknown system {system!r}")
@@ -195,19 +110,20 @@ def _build_select(
         ):
             raise ValueError(f"unknown output set {output!r}")
     trees = excludes or {}
-    # set names are allowlisted, tree names are escaped (they are arbitrary)
+    # set names are allowlisted and attribute names are escaped
     for output in trees:
-        if output not in PER_SYSTEM_SETS:
+        if output not in PER_SYSTEM_SETS and output not in CONFIG_SETS:
             raise ValueError(f"unknown output set {output!r}")
     return (
-        _SELECT_TEMPLATE.replace("@SYSTEMS@", _nix_list(systems))
-        .replace("@PER_SYSTEM@", _nix_list(per_system_sets))
-        .replace("@CONFIG@", _nix_list(config_sets))
-        .replace("@LEAF@", _nix_list(leaf_sets))
-        .replace("@EXCLUDES@", _nix_excludes(trees, systems))
-        # an int, so it cannot carry an injection; clamped to the hard cap
-        .replace("@MAXDEPTH@", str(min(int(max_depth), MAX_RECURSE_DEPTH)))
-        .replace("@DENYLIST@", _nix_list(SCOPE_DENYLIST))
+        _SELECT_TEMPLATE.replace('"@SYSTEMS@"', _nix_list(systems))
+        .replace('"@PER_SYSTEM@"', _nix_list(per_system_sets))
+        .replace('"@CONFIG@"', _nix_list(config_sets))
+        .replace('"@LEAF@"', _nix_list(leaf_sets))
+        # max_depth is an integer clamped to the hard cap
+        .replace('"@MAXDEPTH@"', str(min(int(max_depth), MAX_RECURSE_DEPTH)))
+        .replace('"@DENYLIST@"', _nix_list(SCOPE_DENYLIST))
+        # replace arbitrary names last so names matching tokens stay literal
+        .replace('"@EXCLUDES@"', _nix_excludes(trees, systems))
     )
 
 

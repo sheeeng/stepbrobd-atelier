@@ -10,6 +10,9 @@ dependencies = ["click"]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.package-data]
+atelier = ["*.nix"]
+
 [dependency-groups]
 dev = ["pytest"]
 
