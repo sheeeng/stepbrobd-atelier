@@ -50,17 +50,34 @@ Known limitations:
 
 ## Rule file
 
-`atelier.toml` is itself optional, as are its four keys. A missing rule file (or
-an omitted key) falls back to the defaults below, so a repository with no
+`atelier.toml` is itself optional, as are all of its keys. A missing rule file
+(or an omitted key) falls back to the defaults below, so a repository with no
 `atelier.toml` at all builds the defaults.
 
-| key                   | type            | default                                   | meaning                                              |
-| --------------------- | --------------- | ----------------------------------------- | ---------------------------------------------------- |
-| `systems`             | list of strings | `["x86_64-linux"]`                        | systems to evaluate and build for                    |
-| `include`             | list of globs   | `["packages.*.*", "devShells.*.default"]` | attributes to build                                  |
-| `exclude`             | list of globs   | `[]`                                      | attributes to drop (exclude beats include)           |
-| `substituters`        | list of strings | `[]`                                      | extra caches to check; a cached attribute is skipped |
-| `trusted-public-keys` | list of strings | `[]`                                      | public keys for `substituters`                       |
+| key                   | type            | default                                   | meaning                                                  |
+| --------------------- | --------------- | ----------------------------------------- | -------------------------------------------------------- |
+| `systems`             | list of strings | `["x86_64-linux"]`                        | systems to evaluate and build for                        |
+| `include`             | list of globs   | `["packages.*.*", "devShells.*.default"]` | attributes to build                                      |
+| `exclude`             | list of globs   | `[]`                                      | attributes to drop (exclude beats include)               |
+| `substituters`        | list of strings | `[]`                                      | extra caches checked before building                     |
+| `trusted-public-keys` | list of strings | `[]`                                      | public keys for `substituters`                           |
+| `root`                | string          | `"."`                                     | directory holding `flake.nix`, relative to the repo root |
+
+### Flake in a repository subdirectory
+
+If `flake.nix` does not sit at the repository root (say it lives in `nixos/`),
+set `root` in an `atelier.toml` at the repository root:
+
+```toml
+root = "nixos"
+```
+
+Evaluation and every build cell then address the flake through that subdirectory
+(installables become `./nixos#<attr>`), while the rule file itself stays at the
+repository root. `root` must be a non-empty relative path that stays within the
+checkout. A trailing slash and a `./` prefix are normalized away. A flake inside
+a Git repository only sees files tracked by Git, so the subdirectory's contents
+must be committed.
 
 ### Skipping cached builds
 
@@ -195,8 +212,9 @@ running until the runner reaps job processes.
 
 Atelier runs against whatever repository calls it. `actions/checkout` inside the
 reusable workflow checks out the **caller**, so `--flake .` evaluates your flake
-and every check run lands on your commit. The atelier tool itself is fetched
-from the published flake, so your flake stays entirely your own.
+and every check run lands on your commit. When `root` is set, the same checkout
+is addressed through that subdirectory. The atelier tool itself is fetched from
+the published flake, so your flake stays entirely your own.
 
 ### Call the reusable workflow (recommended)
 

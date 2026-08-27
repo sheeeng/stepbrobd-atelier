@@ -2,7 +2,7 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from atelier import nix
 from atelier.rules import (
@@ -29,6 +29,26 @@ from atelier.types import (
 
 def _warn(message: str) -> None:
     print(f"::warning::{message}", file=sys.stderr)
+
+
+def _flake_ref(flake: str, root: str) -> str:
+    """Resolve `root` beneath a path, URL, or indirect flake reference."""
+    if root == ".":
+        return flake
+
+    parsed = urlsplit(flake)
+    if not parsed.scheme and "/" not in flake and flake not in (".", ".."):
+        flake = f"flake:{flake}"
+        parsed = urlsplit(flake)
+    if parsed.scheme:
+        if any(
+            name == "dir"
+            for name, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        ):
+            raise ValueError("flake reference already contains a dir parameter")
+        sep = "&" if "?" in flake else "?"
+        return f"{flake}{sep}dir={quote(root, safe='/')}"
+    return f"{flake.rstrip('/')}/{root}"
 
 
 def _effective_systems(rules: Rules, enabled: Sequence[str]) -> list[str]:
@@ -143,15 +163,18 @@ def discover(
     reports the eval error). Attrs whose error denotes an expected unbuildable
     state become skipped checks. An attr already in a queried binary cache is
     skipped too, so no runner builds or re-pushes it. Manual excludes are dropped
-    before either.
+    before either. ``rules.root`` points evaluation and every installable at the
+    subdirectory holding flake.nix, so the flake need not sit at the checkout root.
     """
     effective = _effective_systems(rules, enabled_systems)
     per_system, configs, leaves = _output_sets(rules)
     if not effective or (not per_system and not configs and not leaves):
         return [], []
 
+    eval_ref = _flake_ref(flake, rules.root)
+    build_ref = _flake_ref(".", rules.root)
     objects = nix.evaluate(
-        f"{flake}#",
+        f"{eval_ref}#",
         effective,
         per_system,
         configs,
@@ -161,7 +184,7 @@ def discover(
         rules.substituters,
         include_max_depth(rules),
     )
-    jobs = [nix.to_job(obj) for obj in objects]
+    jobs = [nix.to_job(obj, build_ref) for obj in objects]
     selected = _selected(jobs, rules, effective, only)
 
     failed = [job for job in selected if job.error is not None]

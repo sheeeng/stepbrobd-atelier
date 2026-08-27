@@ -284,11 +284,12 @@ def evaluate(
     return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
 
-def to_job(obj: dict[str, Any]) -> Job:
+def to_job(obj: dict[str, Any], flake: str = ".") -> Job:
     """Normalise one nix-eval-jobs object into a `Job`.
 
-    The rooted key carries the set (and system, for per system and leaf sets) so
-    the full attribute path and the buildable installable reconstruct from attrPath.
+    The rooted key carries the set and system needed to reconstruct the full
+    attribute path. `flake` is the checkout-relative reference used by emitted
+    build installables.
     """
     path = ".".join(obj.get("attrPath") or [])
     drv = obj.get("drvPath")
@@ -301,11 +302,11 @@ def to_job(obj: dict[str, Any]) -> Job:
 
     if set_name in CONFIG_SETS:
         system = obj.get("system") or ""
-        installable = f".#{path}.config.system.build.toplevel" if drv else ""
+        installable = f"{flake}#{path}.config.system.build.toplevel" if drv else ""
     else:
         segments = path.split(".")
         system = segments[1] if len(segments) > 1 else (obj.get("system") or "")
-        installable = f".#{path}" if drv else ""
+        installable = f"{flake}#{path}" if drv else ""
 
     return Job(
         path=path, system=system, installable=installable, error=error, cached=cached

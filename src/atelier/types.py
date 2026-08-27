@@ -90,6 +90,10 @@ class Rules:
     substituters: frozenset[str] = frozenset()
     # substituter public keys
     trusted_public_keys: frozenset[str] = frozenset()
+    # directory holding flake.nix relative to the evaluated checkout, "." when
+    # the flake sits at the repository root. evaluation and every build cell's
+    # installable are addressed through it, e.g. `./nixos#<attr>`
+    root: str = "."
 
 
 @dataclass(frozen=True)

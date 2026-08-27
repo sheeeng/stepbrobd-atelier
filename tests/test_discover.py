@@ -1,11 +1,14 @@
 import json
 
+import pytest
+
 from atelier import nix
 from atelier.discover import (
     _cached_skip,
     _cell,
     _chunks,
     _effective_systems,
+    _flake_ref,
     _log_name,
     _output_sets,
     _selected,
@@ -175,6 +178,87 @@ def test_formatter_is_discovered_and_built(monkeypatch) -> None:
     assert [c["label"] for c in built] == ["formatter.x86_64-linux"]
     assert built[0]["installable"] == ".#formatter.x86_64-linux"
     assert built[0]["system"] == "x86_64-linux"
+
+
+def test_flake_ref_joins_root() -> None:
+    assert _flake_ref(".", ".") == "."
+    assert _flake_ref(".", "nixos") == "./nixos"
+    assert _flake_ref("/abs/checkout", "nixos") == "/abs/checkout/nixos"
+    assert _flake_ref("github:o/r", "nixos") == "github:o/r?dir=nixos"
+    assert _flake_ref("git+https://x/y?ref=main", "nixos") == (
+        "git+https://x/y?ref=main&dir=nixos"
+    )
+    assert _flake_ref("nixpkgs", "nixos") == "flake:nixpkgs?dir=nixos"
+    assert _flake_ref("github:o/r", "nix&os") == "github:o/r?dir=nix%26os"
+
+
+def test_flake_ref_rejects_existing_dir() -> None:
+    with pytest.raises(ValueError, match="already contains a dir"):
+        _flake_ref("github:o/r?dir=nixos", "nested")
+
+
+def test_root_threads_into_eval_and_installables(monkeypatch) -> None:
+    objects = [
+        {
+            "attrPath": ["packages.x86_64-linux", "hello"],
+            "drvPath": "/nix/store/x.drv",
+            "system": "x86_64-linux",
+            "cacheStatus": "notBuilt",
+        },
+        {
+            "attrPath": ["nixosConfigurations", "baldy"],
+            "drvPath": "/nix/store/z.drv",
+            "system": "x86_64-linux",
+            "cacheStatus": "notBuilt",
+        },
+    ]
+    seen: dict[str, object] = {}
+
+    def fake_evaluate(flake, *args, **kwargs):
+        seen["flake"] = flake
+        return objects
+
+    monkeypatch.setattr(nix, "evaluate", fake_evaluate)
+    rules = Rules(
+        systems=("x86_64-linux",),
+        include=("packages.*.*", "nixosConfigurations.*"),
+        exclude=(),
+        root="nixos",
+    )
+    chunks, _skipped = discover(rules, [], None, 2)
+    assert seen["flake"] == "./nixos#"
+    built = [c for chunk in chunks for c in json.loads(chunk.cells)["include"]]
+    assert [c["installable"] for c in built] == [
+        "./nixos#packages.x86_64-linux.hello",
+        "./nixos#nixosConfigurations.baldy.config.system.build.toplevel",
+    ]
+
+
+def test_nondefault_eval_flake_keeps_local_installables(monkeypatch) -> None:
+    objects = [
+        {
+            "attrPath": ["packages.x86_64-linux", "hello"],
+            "drvPath": "/nix/store/x.drv",
+            "system": "x86_64-linux",
+            "cacheStatus": "notBuilt",
+        }
+    ]
+    seen: dict[str, object] = {}
+
+    def fake_evaluate(flake, *args, **kwargs):
+        seen["flake"] = flake
+        return objects
+
+    monkeypatch.setattr(nix, "evaluate", fake_evaluate)
+    rules = Rules(
+        systems=("x86_64-linux",),
+        include=("packages.*.*",),
+        exclude=(),
+    )
+    chunks, _skipped = discover(rules, [], None, 2, flake="github:o/r")
+    assert seen["flake"] == "github:o/r#"
+    built = json.loads(chunks[0].cells)["include"]
+    assert built[0]["installable"] == ".#packages.x86_64-linux.hello"
 
 
 def test_single_chunk_named_build() -> None:

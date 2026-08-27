@@ -1,4 +1,5 @@
 import fnmatch
+import posixpath
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,21 @@ from atelier.types import (
 _GLOB_CHARS = frozenset("*?[]")
 
 
+def _normalize_root(root: object) -> str:
+    """Normalize a validated repository-relative flake directory."""
+    if not isinstance(root, str):
+        raise TypeError("root must be a string")
+    if not root:
+        raise ValueError("root must not be empty")
+    if posixpath.isabs(root):
+        raise ValueError("root must be relative to the repository")
+
+    normalized = posixpath.normpath(root)
+    if normalized == ".." or normalized.startswith("../"):
+        raise ValueError("root must stay within the repository")
+    return normalized
+
+
 def _build(data: dict[str, Any]) -> Rules:
     """Build ``Rules`` from parsed toml, falling back to defaults for omitted keys.
 
@@ -28,6 +44,7 @@ def _build(data: dict[str, Any]) -> Rules:
         exclude=tuple(data.get("exclude", ())),
         substituters=frozenset(data.get("substituters", ())) | {NIXOS_CACHE},
         trusted_public_keys=frozenset(data.get("trusted-public-keys", ())),
+        root=_normalize_root(data.get("root", ".")),
     )
 
 

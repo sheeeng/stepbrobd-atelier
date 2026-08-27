@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from atelier.rules import (
     defaults,
     excluded,
@@ -120,6 +122,39 @@ def test_defaults_carry_every_built_in() -> None:
     assert rules.include == DEFAULT_INCLUDE
     assert rules.exclude == ()
     assert rules.substituters == frozenset({NIXOS_CACHE})
+    assert rules.root == "."
+
+
+def test_load_root_names_the_flake_subdirectory(tmp_path: Path) -> None:
+    rules = load(_write(tmp_path, 'root = "nixos"\n'))
+    assert rules.root == "nixos"
+
+
+def test_load_root_normalizes_relative_path(tmp_path: Path) -> None:
+    assert load(_write(tmp_path, 'root = "./nixos/"\n')).root == "nixos"
+    assert load(_write(tmp_path, 'root = "nix/os"\n')).root == "nix/os"
+    assert load(_write(tmp_path, 'root = "./"\n')).root == "."
+
+
+@pytest.mark.parametrize("value", ["7", '["nixos"]'])
+def test_load_rejects_nonstring_root(tmp_path: Path, value: str) -> None:
+    with pytest.raises(TypeError, match="must be a string"):
+        load(_write(tmp_path, f"root = {value}\n"))
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ('""', "must not be empty"),
+        ('"/nixos"', "must be relative"),
+        ('"nixos/../../flake"', "must stay within"),
+    ],
+)
+def test_load_rejects_invalid_root(
+    tmp_path: Path, value: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        load(_write(tmp_path, f"root = {value}\n"))
 
 
 def test_load_substituters_default_to_nixos_cache(tmp_path: Path) -> None:
