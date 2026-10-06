@@ -123,6 +123,7 @@ runs:
           echo "build-dir = /nix/build"
           echo "fsync-metadata = false"
           echo "http3 = true"
+          echo "keep-going = true"
           echo "system = ${SYSTEM}"
           echo "sandbox = ${SANDBOX}"
           if [ -n "${subs}" ]; then
