@@ -12,12 +12,20 @@ succeeded, the final outputs' closure. Both modes exit 0 unconditionally
 because a cache push never fails a build.
 """
 
+import os
+import sys
+
+# run by file path, python puts this directory first on sys.path, where the
+# package's types.py would shadow the standard library module of that name
+if sys.path and os.path.realpath(sys.path[0]) == os.path.dirname(
+    os.path.realpath(__file__)
+):
+    del sys.path[0]
+
 import argparse
 import json
-import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
