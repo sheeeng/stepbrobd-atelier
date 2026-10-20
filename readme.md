@@ -96,7 +96,7 @@ system listed in `systems` that is not one of these is skipped with a warning.
 
 | system           | runner             |
 | ---------------- | ------------------ |
-| `x86_64-linux`   | `ubuntu-latest`    |
+| `x86_64-linux`   | `ubuntu-24.04`     |
 | `aarch64-linux`  | `ubuntu-24.04-arm` |
 | `aarch64-darwin` | `macos-latest`     |
 
