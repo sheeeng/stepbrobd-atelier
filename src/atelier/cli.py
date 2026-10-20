@@ -124,7 +124,7 @@ def discover(
 def _emit(name: str, value: object) -> None:
     """Append a workflow output under Actions, otherwise print to stdout."""
     payload = json.dumps(value)
-    github_output = os.environ.get("GITHUB_OUTPUT")
+    github_output = os.environ.get("GITHUB_OUTPUT", "")
     if github_output:
         with open(github_output, "a", encoding="utf-8") as handle:
             handle.write(f"{name}={payload}\n")

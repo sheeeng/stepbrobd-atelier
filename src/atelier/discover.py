@@ -123,7 +123,7 @@ def _cell(job: Job) -> Cell:
         runner=RUNNERS.get(job.system, DEFAULT_RUNNER),
         label=job.path,
         installable=job.installable,
-        error=nix.clean_error(job.error) if job.error else "",
+        error=nix.clean_error(job.error or ""),
         log=_log_name(job.path),
     )
 

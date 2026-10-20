@@ -165,8 +165,8 @@ class Cachix:
 
     def setup(self) -> None:
         # pushing needs credentials, fail once here instead of every batch
-        if not os.environ.get("CACHIX_AUTH_TOKEN") and not os.environ.get(
-            "CACHIX_SIGNING_KEY"
+        if not os.environ.get("CACHIX_AUTH_TOKEN", "") and not os.environ.get(
+            "CACHIX_SIGNING_KEY", ""
         ):
             raise RuntimeError("CACHIX_AUTH_TOKEN is not set")
         _ensure("cachix", "nixpkgs#cachix")
@@ -174,7 +174,7 @@ class Cachix:
     def push(self, paths: list[str]) -> None:
         env = dict(os.environ)
         # cachix rejects an empty signing key, absent means unsigned
-        if not env.get("CACHIX_SIGNING_KEY"):
+        if env.get("CACHIX_SIGNING_KEY") == "":
             env.pop("CACHIX_SIGNING_KEY", None)
         _run(["cachix", "push", self.cache], stdin="\n".join(paths) + "\n", env=env)
 
@@ -191,7 +191,7 @@ class Niks3:
         _ensure("niks3", "github:stepbrobd/inc#niks3")
         if self.token:
             self.auth = ("--auth-token-path", _secret(self.token))
-        elif os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL"):
+        elif os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", ""):
             audience = _audience(self.server)
             if not audience:
                 raise RuntimeError(
@@ -210,13 +210,13 @@ class Niks3:
 def backends() -> list[Backend]:
     env = os.environ
     out: list[Backend] = []
-    if env.get("ATTIC_SERVER") and env.get("ATTIC_CACHE"):
+    if env.get("ATTIC_SERVER", "") and env.get("ATTIC_CACHE", ""):
         out.append(
             Attic(env["ATTIC_SERVER"], env["ATTIC_CACHE"], env.get("ATTIC_TOKEN", ""))
         )
-    if env.get("CACHIX_CACHE"):
+    if env.get("CACHIX_CACHE", ""):
         out.append(Cachix(env["CACHIX_CACHE"]))
-    if env.get("NIKS3_SERVER"):
+    if env.get("NIKS3_SERVER", ""):
         out.append(Niks3(env["NIKS3_SERVER"], env.get("NIKS3_TOKEN", "")))
     return out
 

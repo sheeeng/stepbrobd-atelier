@@ -97,7 +97,7 @@ def test_module_keeps_python_312_floor() -> None:
     } | {
         node.module.split(".")[0]
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module
+        if isinstance(node, ast.ImportFrom) and node.module is not None
     }
     assert imported <= sys.stdlib_module_names
 
