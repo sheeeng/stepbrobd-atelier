@@ -3,7 +3,9 @@ from typing import Final
 
 # nix system to github hosted runner label
 RUNNERS: Final[dict[str, str]] = {
-    "x86_64-linux": "ubuntu-latest",
+    # pinned since ubuntu-latest moved to ubuntu-26.04, where apt's solver
+    # times out on the purge list nothing-but-nix's rampage protocol removes
+    "x86_64-linux": "ubuntu-24.04",
     "aarch64-linux": "ubuntu-24.04-arm",  # no ubuntu-latest-arm label exists
     "aarch64-darwin": "macos-latest",
 }
